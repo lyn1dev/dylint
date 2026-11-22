@@ -7,14 +7,14 @@ extern crate rustc_span;
 
 use clippy_utils::diagnostics::span_lint_and_note;
 use rustc_hir::{
-    HirId, Item, ItemKind, Node, OwnerNode, Path, PathSegment, UseKind, UsePath,
+    HirId, Item, ItemKind, Node, OwnerNode, Path, PathSegment, UseKind, UsePath, UseTree,
     def::{DefKind, Res},
     def_id::{CRATE_DEF_ID, DefId},
     intravisit::{Visitor, walk_item},
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::Symbol;
+use rustc_span::{Span, Symbol, symbol::kw};
 
 dylint_linting::declare_late_lint! {
     /// ### What it does
@@ -79,7 +79,7 @@ impl<'tcx> LateLintPass<'tcx> for InconsistentQualification {
                 Node::Item(Item {
                     kind: ItemKind::Use(..),
                     ..
-                })
+                }) | Node::NestedUseTree(_)
             )
         {
             // Check only modules present in the path, not all ancestors of the resolved item.
@@ -150,6 +150,82 @@ impl<'tcx> UseVisitor<'_, 'tcx, '_> {
             }
         }
     }
+
+    fn match_use_tree(
+        &self,
+        tree: &UseTree<'tcx>,
+        prefix: &[Symbol],
+    ) -> Option<(PathMatch<'tcx>, Span)> {
+        let mut use_syms = prefix.to_vec();
+        use_syms.extend(
+            tree.prefix
+                .segments
+                .iter()
+                .map(|segment| segment.ident.name),
+        );
+
+        if let UseKind::Nested { items } = tree.kind {
+            return items
+                .iter()
+                .find_map(|(nested_tree, ..)| self.match_use_tree(nested_tree, &use_syms));
+        }
+
+        // Ignore underscore imports, including those within a nested use tree.
+        if matches!(tree.kind, UseKind::Single(ident) if ident.name.as_str() == "_") {
+            return None;
+        }
+
+        let use_path = tree.prefix;
+        let local_owner_path = if use_path.res.iter().flatten().copied().any(is_local) {
+            let local_def_id = self
+                .enclosing_scope_hir_id
+                .and_then(|hir_id| get_owner(self.cx.tcx, hir_id))
+                .map_or(CRATE_DEF_ID, |owner| owner.def_id().def_id);
+            self.cx.get_def_path(local_def_id.into())
+        } else {
+            Vec::new()
+        };
+        // In `use path::{self, item}`, `self` imports `path` itself. Unlike a
+        // plain `use path::self`, lowering keeps the relative `self` segment.
+        if matches!(tree.kind, UseKind::Single(_))
+            && use_path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident.name == kw::SelfLower)
+        {
+            use_syms.pop();
+        }
+        let syms = local_owner_path
+            .into_iter()
+            .chain(use_syms)
+            .collect::<Vec<_>>();
+        let path_match = match tree.kind {
+            UseKind::Single(_) => {
+                if let Some(matched_prefix) = match_path_prefix(use_path, self.path) {
+                    Some(PathMatch::Prefix(matched_prefix))
+                } else if !syms.is_empty() && syms[..syms.len() - 1] == *self.syms_mod {
+                    Some(PathMatch::Mod)
+                } else {
+                    None
+                }
+            }
+            UseKind::Glob => (syms == self.syms_mod).then_some(PathMatch::Mod),
+            UseKind::Nested { .. } => None,
+        };
+        let Some(path_match) = path_match else {
+            return None;
+        };
+        let use_path_is_trait = use_path
+            .res
+            .iter()
+            .flatten()
+            .any(|res| matches!(res, Res::Def(DefKind::Trait, _)));
+        // A trait import must match a prefix of the qualified path exactly.
+        if use_path_is_trait && !matches!(path_match, PathMatch::Prefix(_)) {
+            return None;
+        }
+        Some((path_match, use_path.span))
+    }
 }
 
 enum PathMatch<'hir> {
@@ -170,52 +246,9 @@ impl<'tcx> Visitor<'tcx> for UseVisitor<'_, 'tcx, '_> {
         }
 
         if !item.span.from_expansion()
-            // smoelius: Ignore underscore imports.
-            && item.kind.ident().is_none_or(|name| name.as_str() != "_")
             && self.cx.tcx.hir_get_enclosing_scope(item.hir_id()) == self.enclosing_scope_hir_id
-            && let ItemKind::Use(use_path, use_kind) = item.kind
-            && let local_owner_path = if use_path.res.iter().flatten().copied().any(is_local) {
-                let local_def_id = self
-                    .enclosing_scope_hir_id
-                    .and_then(|hir_id| get_owner(self.cx.tcx, hir_id))
-                    .map_or(CRATE_DEF_ID, |owner| owner.def_id().def_id);
-                self.cx.get_def_path(local_def_id.into())
-            } else {
-                Vec::new()
-            }
-            && let syms = local_owner_path
-                .into_iter()
-                .chain(use_path.segments.iter().map(|segment| segment.ident.name))
-                .collect::<Vec<_>>()
-            && let Some(path_match) = {
-                match use_kind {
-                    UseKind::Single(_)=> {
-                        if let Some(matched_prefix) = match_path_prefix(use_path, self.path) {
-                            Some(PathMatch::Prefix(matched_prefix))
-                        } else if syms[..syms.len() - 1] == *self.syms_mod {
-                            Some(PathMatch::Mod)
-                        } else {
-                            None
-                        }
-                    }
-                    UseKind::Glob => {
-                        if syms == self.syms_mod {
-                            Some(PathMatch::Mod)
-                        } else {
-                            None
-                        }
-                    }
-                    UseKind::ListStem => None,
-                }
-            }
-            && let use_path_is_trait = use_path
-                .res
-                .iter()
-                .flatten()
-                .any(|res| matches!(res, Res::Def(DefKind::Trait, _)))
-            // smoelius: If `use_path` corresponds to a trait, then it must match some prefix of
-            // `self.path` exactly for a warning to be emitted.
-            && (!use_path_is_trait || matches!(path_match, PathMatch::Prefix(_)))
+            && let ItemKind::Use(tree) = &item.kind
+            && let Some((path_match, leaf_span)) = self.match_use_tree(tree, &[])
         {
             let (span, msg) = match path_match {
                 PathMatch::Prefix(matched_prefix) => {
@@ -242,7 +275,11 @@ impl<'tcx> Visitor<'tcx> for UseVisitor<'_, 'tcx, '_> {
                 INCONSISTENT_QUALIFICATION,
                 span,
                 "inconsistent qualification",
-                Some(item.span),
+                Some(if matches!(tree.kind, UseKind::Nested { .. }) {
+                    leaf_span
+                } else {
+                    item.span
+                }),
                 msg,
             );
             self.diagnostic_emitted = true;
@@ -262,8 +299,8 @@ fn get_owner(tcx: TyCtxt<'_>, hir_id: HirId) -> Option<OwnerNode<'_>> {
 }
 
 fn match_path_prefix<'hir>(
-    use_path: &'hir UsePath<'_>,
-    path: &'hir Path<'hir>,
+    use_path: &UsePath<'_>,
+    path: &Path<'hir>,
 ) -> Option<&'hir [PathSegment<'hir>]> {
     // smoelius: `skip(1)` to prevent matching `path`'s first segment.
     for (i, segment) in path.segments.iter().enumerate().skip(1).rev() {
